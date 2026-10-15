@@ -18,7 +18,7 @@ VFIO_UAPI_OK := $(shell printf '%s\n' \
 	'struct vfio_device_bind_iommufd bind;' \
 	'struct vfio_device_feature_dma_buf buf;' \
 	'struct vfio_region_dma_range range;' \
-	'unsigned int api = VFIO_DEVICE_BIND_IOMMUFD | VFIO_DEVICE_FEATURE | VFIO_DEVICE_FEATURE_GET | VFIO_DEVICE_FEATURE_DMA_BUF | VFIO_DEVICE_FEATURE_DMA_BUF_ATTR_UC;' \
+	'unsigned int api = VFIO_DEVICE_BIND_IOMMUFD | VFIO_DEVICE_FEATURE | VFIO_DEVICE_FEATURE_GET | VFIO_DEVICE_FEATURE_DMA_BUF;' \
 	| $(CC) $(CPPFLAGS) -include linux/vfio.h -x c -fsyntax-only - \
 	>/dev/null 2>&1 && echo yes)
 
