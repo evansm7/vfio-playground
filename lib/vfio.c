@@ -143,7 +143,7 @@ int vfio_for_each_mappable_region(int fd, const struct vfio_device_info *info,
 		if (ioctl(fd, VFIO_DEVICE_GET_REGION_INFO, &raw) < 0) {
 			fprintf(stderr, "VFIO_DEVICE_GET_REGION_INFO for region %u failed: %s\n",
 				i, strerror(errno));
-			return -1;
+			continue;
 		}
 		if (raw.info.argsz < sizeof(raw.info) || raw.info.argsz > sizeof(raw)) {
 			fprintf(stderr, "VFIO region %u info size %u does not fit the %zu-byte stack buffer\n",
