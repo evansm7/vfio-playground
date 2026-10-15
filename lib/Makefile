@@ -1,7 +1,8 @@
 include ../common.mk
 
-TARGET := libvfio.a
-OBJS := vfio.o
+BUILD_DIR := $(BUILD_ROOT)/lib
+TARGET := $(BUILD_DIR)/libvfio.a
+OBJS := $(BUILD_DIR)/vfio.o
 DEPS := $(OBJS:.o=.d)
 
 .PHONY: all clean
@@ -11,10 +12,13 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(AR) rcs $@ $^
 
-%.o: %.c
+$(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
 
+$(BUILD_DIR):
+	mkdir -p $@
+
 clean:
-	$(RM) $(TARGET) $(OBJS) $(DEPS)
+	$(RM) -r $(BUILD_DIR)
 
 -include $(DEPS)

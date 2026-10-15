@@ -1,3 +1,5 @@
+include common.mk
+
 SUBDIRS := lib vfio-barmap-perf
 
 .PHONY: all clean $(SUBDIRS)
@@ -10,4 +12,4 @@ $(SUBDIRS):
 	$(MAKE) -C $@
 
 clean:
-	@for dir in $(SUBDIRS); do $(MAKE) -C $$dir clean || exit $$?; done
+	$(RM) -r $(BUILD_ROOT)
