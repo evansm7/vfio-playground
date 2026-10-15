@@ -19,6 +19,11 @@ int vfio_open_cdev(const char *path, int *iommufd);
 
 int vfio_get_device_info(int fd, struct vfio_device_info *info);
 
+/* Export the entire region as one DMABUF range. Return an owned fd, or -1
+ * with a diagnostic. The caller must keep the device open while using it.
+ */
+int vfio_export_region_dmabuf(int fd, const struct vfio_region *region);
+
 /* Visit nonempty regions advertising mmap support without sparse mmap caps. The region pointer is
  * valid only during the callback. Return 0 on success, -1 on error, or the
  * callback's nonzero return value to stop enumeration early.

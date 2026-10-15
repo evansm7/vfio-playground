@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -58,6 +59,37 @@ int vfio_get_device_info(int fd, struct vfio_device_info *info)
 		return -1;
 	}
 	return 0;
+}
+
+int vfio_export_region_dmabuf(int fd, const struct vfio_region *region)
+{
+	struct {
+		struct vfio_device_feature feature;
+		struct vfio_device_feature_dma_buf dma_buf;
+		struct vfio_region_dma_range range;
+	} request = {
+		.feature = {
+			.argsz = sizeof(request),
+			.flags = VFIO_DEVICE_FEATURE_GET | VFIO_DEVICE_FEATURE_DMA_BUF,
+		},
+		.dma_buf = {
+			.region_index = region->index,
+			.open_flags = O_RDWR | O_CLOEXEC,
+			.flags = VFIO_DEVICE_FEATURE_DMA_BUF_ATTR_UC,
+			.nr_ranges = 1,
+		},
+		.range = {
+			.offset = 0,
+			.length = region->size,
+		},
+	};
+	int dmabuf_fd;
+
+	dmabuf_fd = ioctl(fd, VFIO_DEVICE_FEATURE, &request);
+	if (dmabuf_fd < 0)
+		fprintf(stderr, "Cannot export BAR%u (%" PRIu64 " bytes) as DMABUF: %s\n",
+			region->index, region->size, strerror(errno));
+	return dmabuf_fd;
 }
 
 static int has_sparse_mmap(const struct vfio_region_info *info)

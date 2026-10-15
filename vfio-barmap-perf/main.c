@@ -1,6 +1,8 @@
 #include <errno.h>
+#include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,8 +21,9 @@ struct bar_selection {
 
 static void usage(FILE *stream, const char *program)
 {
-	fprintf(stream, "Usage: %s -d /dev/vfio/devices/vfioN\n"
+	fprintf(stream, "Usage: %s -d /dev/vfio/devices/vfioN [--map-dmabuf]\n"
 		"  -d PATH  VFIO device cdev (required)\n"
+		"  --map-dmabuf  Export and mmap a DMABUF covering the entire BAR\n"
 		"  -h       Show this help\n", program);
 }
 
@@ -66,20 +69,22 @@ static int time_pass(void *mapping, size_t length, size_t page_size,
 	return 0;
 }
 
-static int measure_bar(int fd, const struct vfio_region *bar)
+static int measure_bar(int fd, const struct vfio_region *bar, bool map_dmabuf)
 {
 	int page_size = getpagesize();
 	size_t length, pages;
 	void *mapping;
 	uint64_t first_us, second_us, difference_us;
+	int map_fd = fd, dmabuf_fd = -1;
+	off_t map_offset = 0;
 	int ret = -1;
 
 	if (page_size <= 0 || page_size % sizeof(uint32_t)) {
 		fprintf(stderr, "Invalid base page size: %d\n", page_size);
 		return -1;
 	}
-	if (bar->size > SIZE_MAX || bar->offset > INT64_MAX ||
-	    bar->size % page_size || bar->offset % page_size) {
+	if (bar->size > SIZE_MAX || bar->size % page_size ||
+	    (!map_dmabuf && (bar->offset > INT64_MAX || bar->offset % page_size))) {
 		fprintf(stderr, "BAR%u size or offset cannot be mapped as whole system pages\n",
 			bar->index);
 		return -1;
@@ -87,12 +92,22 @@ static int measure_bar(int fd, const struct vfio_region *bar)
 	length = bar->size;
 	pages = length / page_size;
 
+	if (map_dmabuf) {
+		dmabuf_fd = vfio_export_region_dmabuf(fd, bar);
+		if (dmabuf_fd < 0)
+			return -1;
+		map_fd = dmabuf_fd;
+	} else {
+		map_offset = bar->offset;
+	}
+
 	/* Leave the VMA untouched until the first timed pass. */
-	mapping = mmap(NULL, length, PROT_WRITE, MAP_SHARED, fd, (off_t)bar->offset);
+	mapping = mmap(NULL, length, PROT_WRITE, MAP_SHARED, map_fd, map_offset);
 	if (mapping == MAP_FAILED) {
-		fprintf(stderr, "Cannot mmap BAR%u (%" PRIu64 " bytes): %s\n",
-			bar->index, bar->size, strerror(errno));
-		return -1;
+		fprintf(stderr, "Cannot mmap BAR%u via %s (%" PRIu64 " bytes): %s\n",
+			bar->index, map_dmabuf ? "DMABUF" : "VFIO cdev",
+			bar->size, strerror(errno));
+		goto close_dmabuf;
 	}
 
 	if (time_pass(mapping, length, page_size, &first_us) < 0 ||
@@ -101,6 +116,7 @@ static int measure_bar(int fd, const struct vfio_region *bar)
 
 	printf("BAR%u: %" PRIu64 " bytes, %zu pages, %d-byte base pages\n",
 	       bar->index, bar->size, pages, page_size);
+	printf("Mapping: %s\n", map_dmabuf ? "DMABUF" : "VFIO cdev");
 	printf("First access:  %" PRIu64 " us total, %" PRIu64 " ns/page\n",
 	       first_us, first_us * 1000 / pages);
 	printf("Second access: %" PRIu64 " us total, %" PRIu64 " ns/page\n",
@@ -124,19 +140,28 @@ unmap:
 		fprintf(stderr, "Cannot unmap BAR%u: %s\n", bar->index, strerror(errno));
 		ret = -1;
 	}
+close_dmabuf:
+	if (dmabuf_fd >= 0)
+		close(dmabuf_fd);
 	return ret;
 }
 
 int main(int argc, char **argv)
 {
+	enum { OPT_MAP_DMABUF = 256 };
+	static const struct option long_options[] = {
+		{ "map-dmabuf", no_argument, NULL, OPT_MAP_DMABUF },
+		{ 0 },
+	};
 	struct vfio_device_info info;
 	struct bar_selection selection = { 0 };
 	const char *path = NULL;
+	bool map_dmabuf = false;
 	int fd, iommufd, option;
 	int status = EXIT_FAILURE;
 
 	opterr = 0;
-	while ((option = getopt(argc, argv, "d:h")) != -1) {
+	while ((option = getopt_long(argc, argv, "d:h", long_options, NULL)) != -1) {
 		switch (option) {
 		case 'd':
 			path = optarg;
@@ -144,6 +169,9 @@ int main(int argc, char **argv)
 		case 'h':
 			usage(stdout, argv[0]);
 			return EXIT_SUCCESS;
+		case OPT_MAP_DMABUF:
+			map_dmabuf = true;
+			break;
 		default:
 			fprintf(stderr, "Unknown option or missing option argument\n");
 			usage(stderr, argv[0]);
@@ -172,7 +200,7 @@ int main(int argc, char **argv)
 			" MiB found on %s\n", (uint64_t)MIN_BAR_SIZE / 1024 / 1024, path);
 		goto close_fds;
 	}
-	if (!measure_bar(fd, &selection.bar))
+	if (!measure_bar(fd, &selection.bar, map_dmabuf))
 		status = EXIT_SUCCESS;
 
 close_fds:
