@@ -75,7 +75,7 @@ int vfio_export_region_dmabuf(int fd, const struct vfio_region *region)
 		.dma_buf = {
 			.region_index = region->index,
 			.open_flags = O_RDWR | O_CLOEXEC,
-			.flags = VFIO_DEVICE_FEATURE_DMA_BUF_ATTR_UC,
+			.flags = 0,
 			.nr_ranges = 1,
 		},
 		.range = {
