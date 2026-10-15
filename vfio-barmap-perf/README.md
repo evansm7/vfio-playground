@@ -63,4 +63,25 @@ and scheduling. Base page steps do not imply one fault per step: the
 kernel may install larger mappings. Timing measures the CPU issuing the
 stores, without a device readback to drain posted writes.
 
+## Misc notes:
+
+Unbind an endpoint from an existing driver, then bind to VFIO, then
+find the CDEV path:
+
+```
+   # # might need this:
+   # echo 1 > /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts
+   #
+   # lspci -n -s 0000:06:0d.0
+   06:0d.0 0401: 1102:0002 (rev 08)
+   #
+   # echo 0000:06:0d.0 > /sys/bus/pci/devices/0000:06:0d.0/driver/unbind
+   # echo 1102 0002 > /sys/bus/pci/drivers/vfio-pci/new_id
+   # ls /sys/bus/pci/devices/0000\:06\:0d.0/vfio-dev
+   vfio0
+   #
+   # ./vfio-barmap-perf /dev/vfio/devices/vfio0
+```
+
+Clanker direction, review, by Matt Evans.
 Assisted-by: OpenAI Codex (GPT-6 LLM)
