@@ -3,11 +3,13 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "vfio.h"
@@ -19,11 +21,25 @@ struct bar_selection {
 	int found;
 };
 
+struct cold_result {
+	uint64_t elapsed_us;
+	atomic_int status;
+};
+
+struct cold_state {
+	/* Keep the handshake stores on separate cache lines. */
+	_Alignas(64) atomic_uint ready;
+	_Alignas(64) atomic_uint start;
+	_Alignas(64) atomic_uint abort;
+	_Alignas(64) struct cold_result result[2];
+};
+
 static void usage(FILE *stream, const char *program)
 {
-	fprintf(stream, "Usage: %s -d /dev/vfio/devices/vfioN [--map-dmabuf]\n"
+	fprintf(stream, "Usage: %s -d /dev/vfio/devices/vfioN [--map-dmabuf] [--multithreaded]\n"
 		"  -d PATH  VFIO device cdev (required)\n"
 		"  --map-dmabuf  Export and mmap a DMABUF covering the entire BAR\n"
+		"  --multithreaded  Run concurrent cold passes in two processes\n"
 		"  -h       Show this help\n", program);
 }
 
@@ -69,7 +85,146 @@ static int time_pass(void *mapping, size_t length, size_t page_size,
 	return 0;
 }
 
-static int measure_bar(int fd, const struct vfio_region *bar, bool map_dmabuf)
+static void spin_hint(void)
+{
+#if defined(__i386__) || defined(__x86_64__)
+	__asm__ __volatile__("pause" ::: "memory");
+#elif defined(__aarch64__)
+	__asm__ __volatile__("yield" ::: "memory");
+#else
+	atomic_signal_fence(memory_order_seq_cst);
+#endif
+}
+
+static int cold_barrier(struct cold_state *state, int slot)
+{
+	if (slot == 0) {
+		/* The parent releases both walkers once the child has its VMA. */
+		while (!atomic_load_explicit(&state->ready, memory_order_acquire)) {
+			if (atomic_load_explicit(&state->abort, memory_order_acquire))
+				return -1;
+			spin_hint();
+		}
+		if (atomic_load_explicit(&state->abort, memory_order_acquire))
+			return -1;
+		atomic_store_explicit(&state->start, 1, memory_order_release);
+	} else {
+		atomic_store_explicit(&state->ready, 1, memory_order_release);
+		while (!atomic_load_explicit(&state->start, memory_order_acquire)) {
+			if (atomic_load_explicit(&state->abort, memory_order_acquire))
+				return -1;
+			spin_hint();
+		}
+	}
+	return 0;
+}
+
+static int cold_process(struct cold_state *state, int slot, int fd,
+			off_t offset, size_t length, size_t page_size)
+{
+	void *mapping;
+	int ret = -1;
+
+	/* This mmap happens after fork, giving each process cold page tables. */
+	mapping = mmap(NULL, length, PROT_WRITE, MAP_SHARED, fd, offset);
+	if (mapping == MAP_FAILED) {
+		fprintf(stderr, "%s cannot mmap BAR for cold pass: %s\n",
+			slot ? "Child" : "Parent", strerror(errno));
+		goto done;
+	}
+	if (!cold_barrier(state, slot))
+		ret = time_pass(mapping, length, page_size, &state->result[slot].elapsed_us);
+	if (munmap(mapping, length) < 0) {
+		fprintf(stderr, "%s cannot unmap BAR: %s\n",
+			slot ? "Child" : "Parent", strerror(errno));
+		ret = -1;
+	}
+
+done:
+	if (ret)
+		atomic_store_explicit(&state->abort, 1, memory_order_release);
+	atomic_store_explicit(&state->result[slot].status, ret, memory_order_release);
+	return ret;
+}
+
+static int measure_concurrent(int fd, off_t offset, const struct vfio_region *bar,
+			      size_t page_size, bool map_dmabuf)
+{
+	struct cold_state *state;
+	pid_t child, waited;
+	size_t pages = bar->size / page_size;
+	int child_status, ret = -1;
+
+	/* Only the handshake/result memory is mapped before fork. */
+	state = mmap(NULL, sizeof(*state), PROT_READ | PROT_WRITE,
+		     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (state == MAP_FAILED) {
+		fprintf(stderr, "Cannot map shared cold-pass state: %s\n", strerror(errno));
+		return -1;
+	}
+	atomic_init(&state->ready, 0);
+	atomic_init(&state->start, 0);
+	atomic_init(&state->abort, 0);
+	for (int i = 0; i < 2; i++)
+		atomic_init(&state->result[i].status, -1);
+	if (!atomic_is_lock_free(&state->ready) ||
+	    !atomic_is_lock_free(&state->result[0].status)) {
+		fprintf(stderr, "Concurrent mode requires lock-free shared-memory atomics\n");
+		goto unmap_state;
+	}
+
+	child = fork();
+	if (child < 0) {
+		fprintf(stderr, "Cannot fork cold-pass process: %s\n", strerror(errno));
+		goto unmap_state;
+	}
+	if (child == 0) {
+		int status = cold_process(state, 1, fd, offset, bar->size, page_size);
+
+		/* Process exit releases the inherited fds and shared state mapping. */
+		_exit(status ? EXIT_FAILURE : EXIT_SUCCESS);
+	}
+
+	cold_process(state, 0, fd, offset, bar->size, page_size);
+	do {
+		waited = waitpid(child, &child_status, 0);
+	} while (waited < 0 && errno == EINTR);
+	if (waited < 0) {
+		fprintf(stderr, "Cannot wait for cold-pass child: %s\n", strerror(errno));
+		goto unmap_state;
+	}
+	if (WIFSIGNALED(child_status)) {
+		fprintf(stderr, "Cold-pass child terminated by signal %d\n",
+			WTERMSIG(child_status));
+		goto unmap_state;
+	}
+	if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) ||
+	    atomic_load_explicit(&state->result[0].status, memory_order_acquire) ||
+	    atomic_load_explicit(&state->result[1].status, memory_order_acquire))
+		goto unmap_state;
+
+	printf("BAR%u: %" PRIu64 " bytes, %zu pages, %zu-byte base pages\n",
+	       bar->index, bar->size, pages, page_size);
+	printf("Mapping: %s; concurrent cold passes in two processes\n",
+	       map_dmabuf ? "DMABUF" : "VFIO cdev");
+	printf("Parent cold access (PID %ld): %" PRIu64 " us total, %" PRIu64 " ns/page\n",
+	       (long)getpid(), state->result[0].elapsed_us,
+	       state->result[0].elapsed_us * 1000 / pages);
+	printf("Child cold access (PID %ld):  %" PRIu64 " us total, %" PRIu64 " ns/page\n",
+	       (long)child, state->result[1].elapsed_us,
+	       state->result[1].elapsed_us * 1000 / pages);
+	ret = 0;
+
+unmap_state:
+	if (munmap(state, sizeof(*state)) < 0) {
+		fprintf(stderr, "Cannot unmap shared cold-pass state: %s\n", strerror(errno));
+		ret = -1;
+	}
+	return ret;
+}
+
+static int measure_bar(int fd, const struct vfio_region *bar, bool map_dmabuf,
+		       bool multithreaded)
 {
 	int page_size = getpagesize();
 	size_t length, pages;
@@ -99,6 +254,11 @@ static int measure_bar(int fd, const struct vfio_region *bar, bool map_dmabuf)
 		map_fd = dmabuf_fd;
 	} else {
 		map_offset = bar->offset;
+	}
+
+	if (multithreaded) {
+		ret = measure_concurrent(map_fd, map_offset, bar, page_size, map_dmabuf);
+		goto close_dmabuf;
 	}
 
 	/* Leave the VMA untouched until the first timed pass. */
@@ -148,15 +308,17 @@ close_dmabuf:
 
 int main(int argc, char **argv)
 {
-	enum { OPT_MAP_DMABUF = 256 };
+	enum { OPT_MAP_DMABUF = 256, OPT_MULTITHREADED };
 	static const struct option long_options[] = {
 		{ "map-dmabuf", no_argument, NULL, OPT_MAP_DMABUF },
+		{ "multithreaded", no_argument, NULL, OPT_MULTITHREADED },
 		{ 0 },
 	};
 	struct vfio_device_info info;
 	struct bar_selection selection = { 0 };
 	const char *path = NULL;
 	bool map_dmabuf = false;
+	bool multithreaded = false;
 	int fd, iommufd, option;
 	int status = EXIT_FAILURE;
 
@@ -171,6 +333,9 @@ int main(int argc, char **argv)
 			return EXIT_SUCCESS;
 		case OPT_MAP_DMABUF:
 			map_dmabuf = true;
+			break;
+		case OPT_MULTITHREADED:
+			multithreaded = true;
 			break;
 		default:
 			fprintf(stderr, "Unknown option or missing option argument\n");
@@ -200,7 +365,7 @@ int main(int argc, char **argv)
 			" MiB found on %s\n", (uint64_t)MIN_BAR_SIZE / 1024 / 1024, path);
 		goto close_fds;
 	}
-	if (!measure_bar(fd, &selection.bar, map_dmabuf))
+	if (!measure_bar(fd, &selection.bar, map_dmabuf, multithreaded))
 		status = EXIT_SUCCESS;
 
 close_fds:

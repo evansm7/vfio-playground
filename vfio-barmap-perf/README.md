@@ -34,7 +34,25 @@ The export uses one range at BAR offset zero with the full BAR length and
 the default uncached MMIO attribute. Export and mapping occur before timing;
 both mapping modes use the same timed loops.
 
-Each of two consecutive passes writes a volatile 32-bit zero at the start
+Pass `--multithreaded` to measure concurrent initial faults:
+
+```sh
+./build/vfio-barmap-perf/vfio-barmap-perf -d /dev/vfio/devices/vfio0 --multithreaded
+./build/vfio-barmap-perf/vfio-barmap-perf -d /dev/vfio/devices/vfio0 --map-dmabuf --multithreaded
+```
+
+This mode forks before mapping the BAR. The parent and child inherit the
+same VFIO or exported DMABUF fd, then each maps its own untouched VMA and
+runs one cold pass. A shared anonymous mapping holds lock-free C17 atomics:
+the child announces that its VMA is ready and spins until the parent
+releases both walkers. The barrier uses atomic loads/stores and CPU spin
+hints, without syscalls or pipes. Mapping failures abort the handshake.
+The parent waits for the child after its pass and reports both times.
+Scheduling can still introduce start skew; simultaneous execution requires
+both processes to be scheduled on different CPUs.
+
+In the default mode, each of two consecutive passes writes a volatile
+32-bit zero at the start
 of every base system page. Both loops are timed with `gettimeofday()`;
 output includes elapsed microseconds, nanoseconds per page, and the ratio
 and difference between the passes.

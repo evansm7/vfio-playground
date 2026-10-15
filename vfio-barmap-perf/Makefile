@@ -1,4 +1,5 @@
 include ../common.mk
+CFLAGS += -std=gnu17
 
 BUILD_DIR := $(BUILD_ROOT)/vfio-barmap-perf
 TARGET := $(BUILD_DIR)/vfio-barmap-perf
