@@ -37,10 +37,12 @@ struct cold_state {
 static void usage(FILE *stream, const char *program)
 {
 	fprintf(stream, "Usage: %s -d /dev/vfio/devices/vfioN [--map-dmabuf] [--multithreaded]\n"
-		"  -d PATH  VFIO device cdev (required)\n"
-		"  --map-dmabuf  Export and mmap a DMABUF covering the entire BAR\n"
+		"  -d PATH          VFIO device cdev (require either this, or...)\n"
+		"  -r RID           Target endpoint RID, e.g. 0000:01:02.3 (...this, needs group)\n"
+		"  -g <group>       IOMMU group (required when -r used)\n"
+		"  --map-dmabuf     Export and mmap a DMABUF covering the entire BAR\n"
 		"  --multithreaded  Run concurrent cold passes in two processes\n"
-		"  -h       Show this help\n", program);
+		"  -h               Show this help\n", program);
 }
 
 static int select_bar(const struct vfio_region *region, void *data)
@@ -317,16 +319,25 @@ int main(int argc, char **argv)
 	struct vfio_device_info info;
 	struct bar_selection selection = { 0 };
 	const char *path = NULL;
+	const char *rid = NULL;
+	int group = -1;
 	bool map_dmabuf = false;
 	bool multithreaded = false;
-	int fd, iommufd, option;
+	int fd, option;
+	int iommufd = -1;
 	int status = EXIT_FAILURE;
 
 	opterr = 0;
-	while ((option = getopt_long(argc, argv, "d:h", long_options, NULL)) != -1) {
+	while ((option = getopt_long(argc, argv, "d:r:g:h", long_options, NULL)) != -1) {
 		switch (option) {
 		case 'd':
 			path = optarg;
+			break;
+		case 'r':
+			rid = optarg;
+			break;
+		case 'g':
+			group = atoi(optarg);
 			break;
 		case 'h':
 			usage(stdout, argv[0]);
@@ -343,26 +354,43 @@ int main(int argc, char **argv)
 			return EXIT_FAILURE;
 		}
 	}
-	if (!path || !*path || optind != argc) {
+	if ((path && (rid || group != -1)) || (!!rid != (group != -1))) {
+		fprintf(stderr, "Supply either a cdev path, or both a RID + group\n");
+		usage(stderr, argv[0]);
+		return EXIT_FAILURE;
+	}
+	if (!rid && (!path || !*path)) {
 		fprintf(stderr, "A VFIO cdev path must be supplied with -d, with no positional arguments\n");
 		usage(stderr, argv[0]);
 		return EXIT_FAILURE;
 	}
+	if (optind != argc) {
+		usage(stderr, argv[0]);
+		return EXIT_FAILURE;
+	}
 
-	fd = vfio_open_cdev(path, &iommufd);
+	const char *devname;
+	if (path) {
+		devname = path;
+		fd = vfio_open_cdev(path, &iommufd);
+	} else {
+		devname = rid;
+		fd = vfio_open_traditional(group, rid);
+	}
+
 	if (fd < 0)
 		return EXIT_FAILURE;
 	if (vfio_get_device_info(fd, &info) < 0)
 		goto close_fds;
 	if (!(info.flags & VFIO_DEVICE_FLAGS_PCI)) {
-		fprintf(stderr, "%s is not a PCI VFIO device\n", path);
+		fprintf(stderr, "%s is not a PCI VFIO device\n", devname);
 		goto close_fds;
 	}
 	if (vfio_for_each_mappable_region(fd, &info, select_bar, &selection) < 0)
 		goto close_fds;
 	if (!selection.found) {
 		fprintf(stderr, "No writable, mappable PCI BAR without sparse mmap of at least %" PRIu64
-			" MiB found on %s\n", (uint64_t)MIN_BAR_SIZE / 1024 / 1024, path);
+			" MiB found on %s\n", (uint64_t)MIN_BAR_SIZE / 1024 / 1024, devname);
 		goto close_fds;
 	}
 	if (!measure_bar(fd, &selection.bar, map_dmabuf, multithreaded))
@@ -370,6 +398,7 @@ int main(int argc, char **argv)
 
 close_fds:
 	close(fd);
-	close(iommufd);
+	if (fd != -1)
+		close(iommufd);
 	return status;
 }

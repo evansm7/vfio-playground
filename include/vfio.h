@@ -17,6 +17,11 @@ struct vfio_region {
  */
 int vfio_open_cdev(const char *path, int *iommufd);
 
+/* Return a VFIO device fd, or -1.  The caller figures out
+ * the group number associated with the RID string passed in.
+ */
+int vfio_open_traditional(int groupnr, const char *rid_str);
+
 int vfio_get_device_info(int fd, struct vfio_device_info *info);
 
 /* Export the entire region as one DMABUF range. Return an owned fd, or -1

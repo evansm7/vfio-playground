@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -48,6 +49,87 @@ close_device:
 	close(fd);
 	errno = saved_errno;
 	return -1;
+}
+
+int vfio_open_traditional(int groupnr, const char *rid_str)
+{
+	/* Create a new container, add group to it, open device, read
+	 * resource, reset, etc.  Based on the example code in
+	 * Documentation/driver-api/vfio.rst
+	 */
+	int container = open("/dev/vfio/vfio", O_RDWR);
+
+	int r = ioctl(container, VFIO_GET_API_VERSION);
+
+	if (r != VFIO_API_VERSION) {
+		/* Unknown API version */
+		fprintf(stderr, "Unknown API ver %d\n", r);
+		return -1;
+	}
+
+	if (ioctl(container, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU) != 1) {
+		fprintf(stderr, "Doesn't support type 1\n");
+		return -1;
+	}
+
+	char devpath[PATH_MAX];
+
+	snprintf(devpath, PATH_MAX - 1, "/dev/vfio/%d", groupnr);
+	/* Open the group */
+	int group = open(devpath, O_RDWR);
+
+	if (group < 0) {
+		fprintf(stderr, "Can't open VFIO device (group %d)\n", groupnr);
+		return -1;
+	}
+
+	/* Test the group is viable and available */
+	struct vfio_group_status group_status = { .argsz = sizeof(
+							  group_status) };
+
+	if (ioctl(group, VFIO_GROUP_GET_STATUS, &group_status)) {
+		perror("Can't get group status");
+		return -1;
+	}
+
+	if (!(group_status.flags & VFIO_GROUP_FLAGS_VIABLE)) {
+		/* Group is not viable (ie, not all devices bound for vfio) */
+		fprintf(stderr, "Group %d is not viable!\n", groupnr);
+		return -1;
+	}
+
+	/* Add the group to the container */
+	if (ioctl(group, VFIO_GROUP_SET_CONTAINER, &container)) {
+		perror("Can't add group to container");
+		return -1;
+	}
+
+	/* Enable the IOMMU model we want */
+	if (ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU)) {
+		perror("Can't select T1");
+		return -1;
+	}
+
+	/* Get additional IOMMU info */
+	struct vfio_iommu_type1_info iommu_info = { .argsz = sizeof(
+							    iommu_info) };
+
+	if (ioctl(container, VFIO_IOMMU_GET_INFO, &iommu_info)) {
+		perror("Can't get VFIO info");
+		return -1;
+	}
+
+	/* Get a file descriptor for the device */
+	int device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, rid_str);
+
+	if (device < 0) {
+		perror("Can't get device fd");
+		return -1;
+	}
+	close(container);
+	close(group);
+
+	return device;
 }
 
 int vfio_get_device_info(int fd, struct vfio_device_info *info)
