@@ -46,6 +46,9 @@ static void usage(FILE *stream, const char *program)
 		"  -o OFFSET        Map only from this BAR offset (K/M/G suffix ok)\n"
 		"  -l LENGTH        Map only this many bytes of the BAR (default: to end)\n"
 		"  --thp-disable    PR_SET_THP_DISABLE before mapping (4K faults only)\n"
+		"  --align MODE     VA placement vs. the BAR: pte (default; never huge),\n"
+		"                   pmd (2M mappings), pud (1G mappings), any (mmap() picks)\n"
+		"  --stride SIZE    Write once per SIZE bytes (default: base page size)\n"
 		"  -h               Show this help\n", program);
 }
 
@@ -63,9 +66,53 @@ static int select_bar(const struct vfio_region *region, void *data)
 	return 1;
 }
 
-static uint64_t win_offset, win_length;
+static uint64_t win_offset, win_length, stride;
+/* VA minus BAR address, modulo 1G; ALIGN_ANY leaves placement to mmap(). */
+#define ALIGN_PTE	(4ULL << 10)
+#define ALIGN_PMD	(2ULL << 20)
+#define ALIGN_PUD	0ULL
+#define ALIGN_ANY	(~0ULL)
+static uint64_t align_skew = ALIGN_PTE;
 
-static int time_pass(void *mapping, size_t length, size_t page_size,
+/*
+ * Map [offset, offset+length) of fd at a VA chosen relative to the BAR.
+ * mmap(NULL, ...) gives no alignment, so whether faults could use PMD or
+ * PUD mappings would be left to chance.  Reserve 1G of extra VA and
+ * MAP_FIXED the window inside it at the wanted skew: 4K (pte) can never be
+ * mapped huge, 2M (pmd) allows PMDs but no PUDs, 0 (pud) allows PUDs.  PCI
+ * BARs are naturally aligned, so for any BAR big enough to hold a huge page
+ * its address is congruent with win_offset.
+ */
+static void *map_window(int fd, off_t offset, size_t length)
+{
+	const uint64_t G = 1ULL << 30;
+	size_t res_len = length + G;
+	uintptr_t res, va;
+	void *p;
+
+	if (align_skew == ALIGN_ANY)
+		return mmap(NULL, length, PROT_WRITE, MAP_SHARED, fd, offset);
+	p = mmap(NULL, res_len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+	if (p == MAP_FAILED)
+		return MAP_FAILED;
+	res = (uintptr_t)p;
+	va = res + (((win_offset + align_skew) % G - res % G + G) % G);
+	p = mmap((void *)va, length, PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, offset);
+	if (p == MAP_FAILED) {
+		int err = errno;
+
+		munmap((void *)res, res_len);
+		errno = err;
+		return MAP_FAILED;
+	}
+	if (va > res)
+		munmap((void *)res, va - res);
+	if (va + length < res + res_len)
+		munmap((void *)(va + length), res + res_len - va - length);
+	return p;
+}
+
+static int time_pass(void *mapping, size_t length, size_t step,
 		     uint64_t *elapsed_ns)
 {
 	struct timespec start, end;
@@ -76,7 +123,7 @@ static int time_pass(void *mapping, size_t length, size_t page_size,
 		fprintf(stderr, "Cannot sample start time: %s\n", strerror(errno));
 		return -1;
 	}
-	for (size_t offset = 0; offset < length; offset += page_size)
+	for (size_t offset = 0; offset < length; offset += step)
 		*(volatile uint32_t *)(base + offset) = 0;
 	if (clock_gettime(CLOCK_MONOTONIC, &end) < 0) {
 		fprintf(stderr, "Cannot sample end time: %s\n", strerror(errno));
@@ -128,20 +175,20 @@ static int cold_barrier(struct cold_state *state, int slot)
 }
 
 static int cold_process(struct cold_state *state, int slot, int fd,
-			off_t offset, size_t length, size_t page_size)
+			off_t offset, size_t length, size_t step)
 {
 	void *mapping;
 	int ret = -1;
 
 	/* This mmap happens after fork, giving each process cold page tables. */
-	mapping = mmap(NULL, length, PROT_WRITE, MAP_SHARED, fd, offset);
+	mapping = map_window(fd, offset, length);
 	if (mapping == MAP_FAILED) {
 		fprintf(stderr, "%s cannot mmap BAR for cold pass: %s\n",
 			slot ? "Child" : "Parent", strerror(errno));
 		goto done;
 	}
 	if (!cold_barrier(state, slot))
-		ret = time_pass(mapping, length, page_size, &state->result[slot].elapsed_ns);
+		ret = time_pass(mapping, length, step, &state->result[slot].elapsed_ns);
 	if (munmap(mapping, length) < 0) {
 		fprintf(stderr, "%s cannot unmap BAR: %s\n",
 			slot ? "Child" : "Parent", strerror(errno));
@@ -156,11 +203,11 @@ done:
 }
 
 static int measure_concurrent(int fd, off_t offset, const struct vfio_region *bar,
-			      size_t page_size, bool map_dmabuf)
+			      size_t step, bool map_dmabuf)
 {
 	struct cold_state *state;
 	pid_t child, waited;
-	size_t pages = bar->size / page_size;
+	size_t pages = bar->size / step;
 	int child_status, ret = -1;
 
 	/* Only the handshake/result memory is mapped before fork. */
@@ -187,13 +234,13 @@ static int measure_concurrent(int fd, off_t offset, const struct vfio_region *ba
 		goto unmap_state;
 	}
 	if (child == 0) {
-		int status = cold_process(state, 1, fd, offset, bar->size, page_size);
+		int status = cold_process(state, 1, fd, offset, bar->size, step);
 
 		/* Process exit releases the inherited fds and shared state mapping. */
 		_exit(status ? EXIT_FAILURE : EXIT_SUCCESS);
 	}
 
-	cold_process(state, 0, fd, offset, bar->size, page_size);
+	cold_process(state, 0, fd, offset, bar->size, step);
 	do {
 		waited = waitpid(child, &child_status, 0);
 	} while (waited < 0 && errno == EINTR);
@@ -211,8 +258,8 @@ static int measure_concurrent(int fd, off_t offset, const struct vfio_region *ba
 	    atomic_load_explicit(&state->result[1].status, memory_order_acquire))
 		goto unmap_state;
 
-	printf("BAR%u: %" PRIu64 " bytes, %zu pages, %zu-byte base pages\n",
-	       bar->index, bar->size, pages, page_size);
+	printf("BAR%u: %" PRIu64 " bytes, %zu pages, %zu-byte stride\n",
+	       bar->index, bar->size, pages, step);
 	printf("Mapping: %s; concurrent cold passes in two processes\n",
 	       map_dmabuf ? "DMABUF" : "VFIO cdev");
 	printf("Parent cold access (PID %ld): %.3f us total, %.1f ns/page\n",
@@ -253,6 +300,7 @@ static int measure_bar(int fd, const struct vfio_region *full_bar, bool map_dmab
 	size_t length, pages;
 	void *mapping;
 	uint64_t first_ns, second_ns, difference_ns;
+	size_t step;
 	int map_fd = fd, dmabuf_fd = -1;
 	off_t map_offset = 0;
 	int ret = -1;
@@ -275,7 +323,12 @@ static int measure_bar(int fd, const struct vfio_region *full_bar, bool map_dmab
 	}
 	view.size = win_length ? win_length : full_bar->size - win_offset;
 	length = bar->size;
-	pages = length / page_size;
+	if (stride % page_size || stride > length) {
+		fprintf(stderr, "Stride must be a multiple of the page size and fit the window\n");
+		return -1;
+	}
+	step = stride ? stride : (size_t)page_size;
+	pages = length / step;
 	printf("Window: BAR offset 0x%" PRIx64 ", length 0x%zx\n", win_offset, length);
 
 	if (map_dmabuf) {
@@ -289,12 +342,12 @@ static int measure_bar(int fd, const struct vfio_region *full_bar, bool map_dmab
 	}
 
 	if (multithreaded) {
-		ret = measure_concurrent(map_fd, map_offset, bar, page_size, map_dmabuf);
+		ret = measure_concurrent(map_fd, map_offset, bar, step, map_dmabuf);
 		goto close_dmabuf;
 	}
 
 	/* Leave the VMA untouched until the first timed pass. */
-	mapping = mmap(NULL, length, PROT_WRITE, MAP_SHARED, map_fd, map_offset);
+	mapping = map_window(map_fd, map_offset, length);
 	if (mapping == MAP_FAILED) {
 		fprintf(stderr, "Cannot mmap BAR%u via %s (%" PRIu64 " bytes): %s\n",
 			bar->index, map_dmabuf ? "DMABUF" : "VFIO cdev",
@@ -302,12 +355,12 @@ static int measure_bar(int fd, const struct vfio_region *full_bar, bool map_dmab
 		goto close_dmabuf;
 	}
 
-	if (time_pass(mapping, length, page_size, &first_ns) < 0 ||
-	    time_pass(mapping, length, page_size, &second_ns) < 0)
+	if (time_pass(mapping, length, step, &first_ns) < 0 ||
+	    time_pass(mapping, length, step, &second_ns) < 0)
 		goto unmap;
 
-	printf("BAR%u: %" PRIu64 " bytes, %zu pages, %d-byte base pages\n",
-	       bar->index, bar->size, pages, page_size);
+	printf("BAR%u: %" PRIu64 " bytes, %zu pages, %zu-byte stride\n",
+	       bar->index, bar->size, pages, step);
 	printf("Mapping: %s\n", map_dmabuf ? "DMABUF" : "VFIO cdev");
 	printf("First access:  %.3f us total, %.1f ns/page\n",
 	       first_ns / 1e3, (double)first_ns / pages);
@@ -340,11 +393,13 @@ close_dmabuf:
 
 int main(int argc, char **argv)
 {
-	enum { OPT_MAP_DMABUF = 256, OPT_MULTITHREADED, OPT_THP_DISABLE };
+	enum { OPT_MAP_DMABUF = 256, OPT_MULTITHREADED, OPT_THP_DISABLE, OPT_ALIGN, OPT_STRIDE };
 	static const struct option long_options[] = {
 		{ "map-dmabuf", no_argument, NULL, OPT_MAP_DMABUF },
 		{ "multithreaded", no_argument, NULL, OPT_MULTITHREADED },
 		{ "thp-disable", no_argument, NULL, OPT_THP_DISABLE },
+		{ "align", required_argument, NULL, OPT_ALIGN },
+		{ "stride", required_argument, NULL, OPT_STRIDE },
 		{ 0 },
 	};
 	struct vfio_device_info info;
@@ -383,6 +438,23 @@ int main(int argc, char **argv)
 		case OPT_THP_DISABLE:
 			thp_disable = true;
 			break;
+		case OPT_ALIGN:
+			if (!strcmp(optarg, "pte"))
+				align_skew = ALIGN_PTE;
+			else if (!strcmp(optarg, "pmd"))
+				align_skew = ALIGN_PMD;
+			else if (!strcmp(optarg, "pud"))
+				align_skew = ALIGN_PUD;
+			else if (!strcmp(optarg, "any"))
+				align_skew = ALIGN_ANY;
+			else {
+				fprintf(stderr, "--align takes pte, pmd, pud or any\n");
+				return EXIT_FAILURE;
+			}
+			break;
+		case OPT_STRIDE:
+			stride = parse_size(optarg);
+			break;
 		case 'o':
 			win_offset = parse_size(optarg);
 			break;
@@ -403,6 +475,10 @@ int main(int argc, char **argv)
 	if (!rid && (!path || !*path)) {
 		fprintf(stderr, "A VFIO cdev path must be supplied with -d, with no positional arguments\n");
 		usage(stderr, argv[0]);
+		return EXIT_FAILURE;
+	}
+	if (thp_disable && (align_skew == ALIGN_PMD || align_skew == ALIGN_PUD)) {
+		fprintf(stderr, "--thp-disable rules out --align pmd/pud\n");
 		return EXIT_FAILURE;
 	}
 	/*
