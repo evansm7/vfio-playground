@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -44,6 +45,7 @@ static void usage(FILE *stream, const char *program)
 		"  --multithreaded  Run concurrent cold passes in two processes\n"
 		"  -o OFFSET        Map only from this BAR offset (K/M/G suffix ok)\n"
 		"  -l LENGTH        Map only this many bytes of the BAR (default: to end)\n"
+		"  --thp-disable    PR_SET_THP_DISABLE before mapping (4K faults only)\n"
 		"  -h               Show this help\n", program);
 }
 
@@ -338,10 +340,11 @@ close_dmabuf:
 
 int main(int argc, char **argv)
 {
-	enum { OPT_MAP_DMABUF = 256, OPT_MULTITHREADED };
+	enum { OPT_MAP_DMABUF = 256, OPT_MULTITHREADED, OPT_THP_DISABLE };
 	static const struct option long_options[] = {
 		{ "map-dmabuf", no_argument, NULL, OPT_MAP_DMABUF },
 		{ "multithreaded", no_argument, NULL, OPT_MULTITHREADED },
+		{ "thp-disable", no_argument, NULL, OPT_THP_DISABLE },
 		{ 0 },
 	};
 	struct vfio_device_info info;
@@ -351,6 +354,7 @@ int main(int argc, char **argv)
 	int group = -1;
 	bool map_dmabuf = false;
 	bool multithreaded = false;
+	bool thp_disable = false;
 	int fd, option;
 	int iommufd = -1;
 	int status = EXIT_FAILURE;
@@ -376,6 +380,9 @@ int main(int argc, char **argv)
 		case OPT_MULTITHREADED:
 			multithreaded = true;
 			break;
+		case OPT_THP_DISABLE:
+			thp_disable = true;
+			break;
 		case 'o':
 			win_offset = parse_size(optarg);
 			break;
@@ -396,6 +403,14 @@ int main(int argc, char **argv)
 	if (!rid && (!path || !*path)) {
 		fprintf(stderr, "A VFIO cdev path must be supplied with -d, with no positional arguments\n");
 		usage(stderr, argv[0]);
+		return EXIT_FAILURE;
+	}
+	/*
+	 * The THP sysfs "enabled" knob does not stop huge_fault on PFNMAP VMAs;
+	 * the prctl does, and it is inherited across fork().
+	 */
+	if (thp_disable && prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)) {
+		perror("PR_SET_THP_DISABLE");
 		return EXIT_FAILURE;
 	}
 	if (optind != argc) {
