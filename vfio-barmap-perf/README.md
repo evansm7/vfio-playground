@@ -53,9 +53,9 @@ both processes to be scheduled on different CPUs.
 
 In the default mode, each of two consecutive passes writes a volatile
 32-bit zero at the start
-of every base system page. Both loops are timed with `gettimeofday()`;
-output includes elapsed microseconds, nanoseconds per page, and the ratio
-and difference between the passes.
+of every base system page. Both loops are timed with
+`clock_gettime(CLOCK_MONOTONIC)`; output includes elapsed microseconds,
+nanoseconds per page, and the ratio and difference between the passes.
 
 The first pass includes initial mapping faults; the second reuses the
 mapping. The timing difference also includes effects such as TLB state
