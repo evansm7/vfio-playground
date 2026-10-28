@@ -63,6 +63,12 @@ and scheduling. Base page steps do not imply one fault per step: the
 kernel may install larger mappings. Timing measures the CPU issuing the
 stores, without a device readback to drain posted writes.
 
+## Windows, page sizes and stride
+
+`-o OFFSET` and `-l LENGTH` (K/M/G suffixes accepted) restrict the test
+to a window of the selected BAR, so one large BAR can stand in for
+smaller ones, or a large BAR can be measured without touching all of it.
+
 ## Misc notes:
 
 Unbind an endpoint from an existing driver, then bind to VFIO, then

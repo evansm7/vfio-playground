@@ -42,6 +42,8 @@ static void usage(FILE *stream, const char *program)
 		"  -g <group>       IOMMU group (required when -r used)\n"
 		"  --map-dmabuf     Export and mmap a DMABUF covering the entire BAR\n"
 		"  --multithreaded  Run concurrent cold passes in two processes\n"
+		"  -o OFFSET        Map only from this BAR offset (K/M/G suffix ok)\n"
+		"  -l LENGTH        Map only this many bytes of the BAR (default: to end)\n"
 		"  -h               Show this help\n", program);
 }
 
@@ -58,6 +60,8 @@ static int select_bar(const struct vfio_region *region, void *data)
 	selection->found = 1;
 	return 1;
 }
+
+static uint64_t win_offset, win_length;
 
 static int time_pass(void *mapping, size_t length, size_t page_size,
 		     uint64_t *elapsed_ns)
@@ -225,9 +229,24 @@ unmap_state:
 	return ret;
 }
 
-static int measure_bar(int fd, const struct vfio_region *bar, bool map_dmabuf,
+static uint64_t parse_size(const char *arg)
+{
+	char *end;
+	uint64_t v = strtoull(arg, &end, 0);
+
+	switch (*end) {
+	case 'G': case 'g': v <<= 10; /* fallthrough */
+	case 'M': case 'm': v <<= 10; /* fallthrough */
+	case 'K': case 'k': v <<= 10;
+	}
+	return v;
+}
+
+static int measure_bar(int fd, const struct vfio_region *full_bar, bool map_dmabuf,
 		       bool multithreaded)
 {
+	struct vfio_region view = *full_bar;
+	const struct vfio_region *bar = &view;
 	int page_size = getpagesize();
 	size_t length, pages;
 	void *mapping;
@@ -246,16 +265,25 @@ static int measure_bar(int fd, const struct vfio_region *bar, bool map_dmabuf,
 			bar->index);
 		return -1;
 	}
+	if (win_offset % page_size || win_offset >= full_bar->size ||
+	    (win_length && (win_length % page_size || win_length > full_bar->size - win_offset))) {
+		fprintf(stderr, "Window offset/length outside BAR%u or not page aligned\n",
+			bar->index);
+		return -1;
+	}
+	view.size = win_length ? win_length : full_bar->size - win_offset;
 	length = bar->size;
 	pages = length / page_size;
+	printf("Window: BAR offset 0x%" PRIx64 ", length 0x%zx\n", win_offset, length);
 
 	if (map_dmabuf) {
-		dmabuf_fd = vfio_export_region_dmabuf(fd, bar);
+		dmabuf_fd = vfio_export_region_dmabuf(fd, full_bar);
 		if (dmabuf_fd < 0)
 			return -1;
 		map_fd = dmabuf_fd;
+		map_offset = win_offset;
 	} else {
-		map_offset = bar->offset;
+		map_offset = bar->offset + win_offset;
 	}
 
 	if (multithreaded) {
@@ -328,7 +356,7 @@ int main(int argc, char **argv)
 	int status = EXIT_FAILURE;
 
 	opterr = 0;
-	while ((option = getopt_long(argc, argv, "d:r:g:h", long_options, NULL)) != -1) {
+	while ((option = getopt_long(argc, argv, "d:r:g:o:l:h", long_options, NULL)) != -1) {
 		switch (option) {
 		case 'd':
 			path = optarg;
@@ -347,6 +375,12 @@ int main(int argc, char **argv)
 			break;
 		case OPT_MULTITHREADED:
 			multithreaded = true;
+			break;
+		case 'o':
+			win_offset = parse_size(optarg);
+			break;
+		case 'l':
+			win_length = parse_size(optarg);
 			break;
 		default:
 			fprintf(stderr, "Unknown option or missing option argument\n");
