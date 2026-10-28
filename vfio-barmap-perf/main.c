@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/time.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -22,7 +22,7 @@ struct bar_selection {
 };
 
 struct cold_result {
-	uint64_t elapsed_us;
+	uint64_t elapsed_ns;
 	atomic_int status;
 };
 
@@ -60,30 +60,30 @@ static int select_bar(const struct vfio_region *region, void *data)
 }
 
 static int time_pass(void *mapping, size_t length, size_t page_size,
-		     uint64_t *elapsed_us)
+		     uint64_t *elapsed_ns)
 {
-	struct timeval start, end;
-	uint64_t start_us, end_us;
+	struct timespec start, end;
+	uint64_t start_ns, end_ns;
 	volatile unsigned char *base = mapping;
 
-	if (gettimeofday(&start, NULL) < 0) {
+	if (clock_gettime(CLOCK_MONOTONIC, &start) < 0) {
 		fprintf(stderr, "Cannot sample start time: %s\n", strerror(errno));
 		return -1;
 	}
 	for (size_t offset = 0; offset < length; offset += page_size)
 		*(volatile uint32_t *)(base + offset) = 0;
-	if (gettimeofday(&end, NULL) < 0) {
+	if (clock_gettime(CLOCK_MONOTONIC, &end) < 0) {
 		fprintf(stderr, "Cannot sample end time: %s\n", strerror(errno));
 		return -1;
 	}
 
-	start_us = (uint64_t)start.tv_sec * 1000000 + start.tv_usec;
-	end_us = (uint64_t)end.tv_sec * 1000000 + end.tv_usec;
-	if (end_us < start_us) {
+	start_ns = (uint64_t)start.tv_sec * 1000000000 + start.tv_nsec;
+	end_ns = (uint64_t)end.tv_sec * 1000000000 + end.tv_nsec;
+	if (end_ns < start_ns) {
 		fprintf(stderr, "System clock moved backwards during measurement\n");
 		return -1;
 	}
-	*elapsed_us = end_us - start_us;
+	*elapsed_ns = end_ns - start_ns;
 	return 0;
 }
 
@@ -135,7 +135,7 @@ static int cold_process(struct cold_state *state, int slot, int fd,
 		goto done;
 	}
 	if (!cold_barrier(state, slot))
-		ret = time_pass(mapping, length, page_size, &state->result[slot].elapsed_us);
+		ret = time_pass(mapping, length, page_size, &state->result[slot].elapsed_ns);
 	if (munmap(mapping, length) < 0) {
 		fprintf(stderr, "%s cannot unmap BAR: %s\n",
 			slot ? "Child" : "Parent", strerror(errno));
@@ -209,12 +209,12 @@ static int measure_concurrent(int fd, off_t offset, const struct vfio_region *ba
 	       bar->index, bar->size, pages, page_size);
 	printf("Mapping: %s; concurrent cold passes in two processes\n",
 	       map_dmabuf ? "DMABUF" : "VFIO cdev");
-	printf("Parent cold access (PID %ld): %" PRIu64 " us total, %" PRIu64 " ns/page\n",
-	       (long)getpid(), state->result[0].elapsed_us,
-	       state->result[0].elapsed_us * 1000 / pages);
-	printf("Child cold access (PID %ld):  %" PRIu64 " us total, %" PRIu64 " ns/page\n",
-	       (long)child, state->result[1].elapsed_us,
-	       state->result[1].elapsed_us * 1000 / pages);
+	printf("Parent cold access (PID %ld): %.3f us total, %.1f ns/page\n",
+	       (long)getpid(), state->result[0].elapsed_ns / 1e3,
+	       (double)state->result[0].elapsed_ns / pages);
+	printf("Child cold access (PID %ld):  %.3f us total, %.1f ns/page\n",
+	       (long)child, state->result[1].elapsed_ns / 1e3,
+	       (double)state->result[1].elapsed_ns / pages);
 	ret = 0;
 
 unmap_state:
@@ -231,7 +231,7 @@ static int measure_bar(int fd, const struct vfio_region *bar, bool map_dmabuf,
 	int page_size = getpagesize();
 	size_t length, pages;
 	void *mapping;
-	uint64_t first_us, second_us, difference_us;
+	uint64_t first_ns, second_ns, difference_ns;
 	int map_fd = fd, dmabuf_fd = -1;
 	off_t map_offset = 0;
 	int ret = -1;
@@ -272,29 +272,29 @@ static int measure_bar(int fd, const struct vfio_region *bar, bool map_dmabuf,
 		goto close_dmabuf;
 	}
 
-	if (time_pass(mapping, length, page_size, &first_us) < 0 ||
-	    time_pass(mapping, length, page_size, &second_us) < 0)
+	if (time_pass(mapping, length, page_size, &first_ns) < 0 ||
+	    time_pass(mapping, length, page_size, &second_ns) < 0)
 		goto unmap;
 
 	printf("BAR%u: %" PRIu64 " bytes, %zu pages, %d-byte base pages\n",
 	       bar->index, bar->size, pages, page_size);
 	printf("Mapping: %s\n", map_dmabuf ? "DMABUF" : "VFIO cdev");
-	printf("First access:  %" PRIu64 " us total, %" PRIu64 " ns/page\n",
-	       first_us, first_us * 1000 / pages);
-	printf("Second access: %" PRIu64 " us total, %" PRIu64 " ns/page\n",
-	       second_us, second_us * 1000 / pages);
-	if (second_us > 0) {
-		uint64_t ratio_milli = first_us * 1000 / second_us;
+	printf("First access:  %.3f us total, %.1f ns/page\n",
+	       first_ns / 1e3, (double)first_ns / pages);
+	printf("Second access: %.3f us total, %.1f ns/page\n",
+	       second_ns / 1e3, (double)second_ns / pages);
+	if (second_ns > 0) {
+		uint64_t ratio_milli = first_ns * 1000 / second_ns;
 
 		printf("First/second: %" PRIu64 ".%03" PRIu64 "x\n",
 		       ratio_milli / 1000, ratio_milli % 1000);
 	} else {
 		printf("First/second: unavailable (second pass below timer resolution)\n");
 	}
-	difference_us = first_us >= second_us ? first_us - second_us : second_us - first_us;
-	printf("Difference: %s%" PRIu64 " us (%s%" PRIu64 " ns/page)\n",
-	       first_us < second_us ? "-" : "", difference_us,
-	       first_us < second_us ? "-" : "", difference_us * 1000 / pages);
+	difference_ns = first_ns >= second_ns ? first_ns - second_ns : second_ns - first_ns;
+	printf("Difference: %s%.3f us (%s%.1f ns/page)\n",
+	       first_ns < second_ns ? "-" : "", difference_ns / 1e3,
+	       first_ns < second_ns ? "-" : "", (double)difference_ns / pages);
 	ret = 0;
 
 unmap:
