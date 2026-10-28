@@ -53,15 +53,48 @@ both processes to be scheduled on different CPUs.
 
 In the default mode, each of two consecutive passes writes a volatile
 32-bit zero at the start
-of every base system page. Both loops are timed with `gettimeofday()`;
-output includes elapsed microseconds, nanoseconds per page, and the ratio
-and difference between the passes.
+of every base system page. Both loops are timed with
+`clock_gettime(CLOCK_MONOTONIC)`; output includes elapsed microseconds,
+nanoseconds per page, and the ratio and difference between the passes.
 
 The first pass includes initial mapping faults; the second reuses the
 mapping. The timing difference also includes effects such as TLB state
 and scheduling. Base page steps do not imply one fault per step: the
 kernel may install larger mappings. Timing measures the CPU issuing the
 stores, without a device readback to drain posted writes.
+
+## Windows, page sizes and stride
+
+`-o OFFSET` and `-l LENGTH` (K/M/G suffixes accepted) restrict the test
+to a window of the selected BAR, so one large BAR can stand in for
+smaller ones, or a large BAR can be measured without touching all of it.
+
+The THP sysfs `enabled` setting does not stop huge faults on VFIO PFNMAP
+VMAs. `--thp-disable` sets `PR_SET_THP_DISABLE` before mapping, which
+does, so every fault installs a 4K PTE.
+
+`mmap(NULL, ...)` returns a VA with no particular alignment to the BAR,
+so whether faults could install PMD or PUD mappings would be left to
+chance. The tool instead reserves extra VA and maps the window with
+`MAP_FIXED` at a VA chosen relative to the BAR address. `--align pte`
+(the default) offsets it by 4K modulo 2M, so every fault installs a 4K
+PTE while the kernel still attempts, and falls back from, huge faults.
+`--align pmd` and `--align pud` make it congruent modulo 2M or 1G (pmd
+stays off 1G boundaries), so faults install 2M or 1G mappings.
+`--align any` leaves placement to `mmap()`. The BAR is assumed naturally
+aligned, as PCI requires.
+
+`--stride SIZE` writes once per SIZE bytes instead of once per base page.
+With huge mappings use `--stride 2M` or `--stride 1G`, so that each step
+takes exactly one fault and the store loop does not dominate the passes.
+"ns/page" is then per stride step.
+
+```sh
+# 128GB of 4K, 2M and 1G mappings, starting 4GB into the BAR
+./build/vfio-barmap-perf/vfio-barmap-perf -d /dev/vfio/devices/vfio0 -o 4G -l 128G --thp-disable
+./build/vfio-barmap-perf/vfio-barmap-perf -d /dev/vfio/devices/vfio0 -o 4G -l 128G --align pmd --stride 2M
+./build/vfio-barmap-perf/vfio-barmap-perf -d /dev/vfio/devices/vfio0 -o 4G -l 128G --align pud --stride 1G
+```
 
 ## Misc notes:
 
