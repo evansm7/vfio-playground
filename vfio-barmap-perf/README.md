@@ -69,6 +69,10 @@ stores, without a device readback to drain posted writes.
 to a window of the selected BAR, so one large BAR can stand in for
 smaller ones, or a large BAR can be measured without touching all of it.
 
+The THP sysfs `enabled` setting does not stop huge faults on VFIO PFNMAP
+VMAs. `--thp-disable` sets `PR_SET_THP_DISABLE` before mapping, which
+does, so every fault installs a 4K PTE.
+
 ## Misc notes:
 
 Unbind an endpoint from an existing driver, then bind to VFIO, then
