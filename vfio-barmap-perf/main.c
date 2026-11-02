@@ -43,6 +43,8 @@ static void usage(FILE *stream, const char *program)
 		"  -g <group>       IOMMU group (required when -r used)\n"
 		"  --map-dmabuf     Export and mmap a DMABUF covering the entire BAR\n"
 		"  --multithreaded  Run concurrent cold passes in two processes\n"
+		"  --mt-map-late    With --multithreaded, perform separate mmap() in both\n"
+		"                   processes instead of an early map shared between them.\n"
 		"  -o OFFSET        Map only from this BAR offset (K/M/G suffix ok)\n"
 		"  -l LENGTH        Map only this many bytes of the BAR (default: to end)\n"
 		"  --thp-disable    PR_SET_THP_DISABLE before mapping (4K faults only)\n"
@@ -174,8 +176,8 @@ static int cold_barrier(struct cold_state *state, int slot)
 	return 0;
 }
 
-static int cold_process(struct cold_state *state, int slot, int fd,
-			off_t offset, size_t length, size_t step)
+static int cold_process_map(struct cold_state *state, int slot, int fd,
+			    off_t offset, size_t length, size_t step)
 {
 	void *mapping;
 	int ret = -1;
@@ -202,13 +204,28 @@ done:
 	return ret;
 }
 
+static int cold_process(struct cold_state *state, int slot, void *mapping,
+			size_t length, size_t step)
+{
+	int ret = -1;
+
+	if (!cold_barrier(state, slot))
+		ret = time_pass(mapping, length, step, &state->result[slot].elapsed_ns);
+
+	if (ret)
+		atomic_store_explicit(&state->abort, 1, memory_order_release);
+	atomic_store_explicit(&state->result[slot].status, ret, memory_order_release);
+	return ret;
+}
+
 static int measure_concurrent(int fd, off_t offset, const struct vfio_region *bar,
-			      size_t step, bool map_dmabuf)
+			      size_t step, bool map_dmabuf, bool map_early)
 {
 	struct cold_state *state;
 	pid_t child, waited;
 	size_t pages = bar->size / step;
 	int child_status, ret = -1;
+	void *mapping = NULL;
 
 	/* Only the handshake/result memory is mapped before fork. */
 	state = mmap(NULL, sizeof(*state), PROT_READ | PROT_WRITE,
@@ -228,19 +245,40 @@ static int measure_concurrent(int fd, off_t offset, const struct vfio_region *ba
 		goto unmap_state;
 	}
 
+	if (map_early) {
+		/* Map in the parent, and share it with the child;
+		 * this is the same underlying VFIO object, DMABUF,
+		 * etc.  For comparison, a separate mapping in
+		 * parent/child will create different DMABUF objects.
+		 */
+		mapping = map_window(fd, offset, bar->size);
+		if (mapping == MAP_FAILED) {
+			fprintf(stderr, "Cannot mmap BAR for cold pass: %s\n", strerror(errno));
+			goto unmap_state;
+		}
+	}
+
 	child = fork();
 	if (child < 0) {
 		fprintf(stderr, "Cannot fork cold-pass process: %s\n", strerror(errno));
 		goto unmap_state;
 	}
 	if (child == 0) {
-		int status = cold_process(state, 1, fd, offset, bar->size, step);
+		int status;
+		if (map_early)
+			status = cold_process(state, 1, mapping, bar->size, step);
+		else
+			status = cold_process_map(state, 1, fd, offset, bar->size, step);
 
 		/* Process exit releases the inherited fds and shared state mapping. */
 		_exit(status ? EXIT_FAILURE : EXIT_SUCCESS);
 	}
 
-	cold_process(state, 0, fd, offset, bar->size, step);
+	if (map_early)
+		cold_process(state, 0, mapping, bar->size, step);
+	else
+		cold_process_map(state, 0, fd, offset, bar->size, step);
+
 	do {
 		waited = waitpid(child, &child_status, 0);
 	} while (waited < 0 && errno == EINTR);
@@ -260,8 +298,8 @@ static int measure_concurrent(int fd, off_t offset, const struct vfio_region *ba
 
 	printf("BAR%u: %" PRIu64 " bytes, %zu pages, %zu-byte stride\n",
 	       bar->index, bar->size, pages, step);
-	printf("Mapping: %s; concurrent cold passes in two processes\n",
-	       map_dmabuf ? "DMABUF" : "VFIO cdev");
+	printf("Mapping: %s; concurrent cold passes in two processes, mmap %s\n",
+	       map_dmabuf ? "DMABUF" : "VFIO cdev", map_early ? "common" : "in each");
 	printf("Parent cold access (PID %ld): %.3f us total, %.1f ns/page\n",
 	       (long)getpid(), state->result[0].elapsed_ns / 1e3,
 	       (double)state->result[0].elapsed_ns / pages);
@@ -271,6 +309,11 @@ static int measure_concurrent(int fd, off_t offset, const struct vfio_region *ba
 	ret = 0;
 
 unmap_state:
+	if (map_early && munmap(mapping, bar->size) < 0) {
+		fprintf(stderr, "Cannot unmap BAR: %s\n", strerror(errno));
+		ret = -1;
+	}
+
 	if (munmap(state, sizeof(*state)) < 0) {
 		fprintf(stderr, "Cannot unmap shared cold-pass state: %s\n", strerror(errno));
 		ret = -1;
@@ -292,7 +335,7 @@ static uint64_t parse_size(const char *arg)
 }
 
 static int measure_bar(int fd, const struct vfio_region *full_bar, bool map_dmabuf,
-		       bool multithreaded)
+		       bool multithreaded, bool map_early)
 {
 	struct vfio_region view = *full_bar;
 	const struct vfio_region *bar = &view;
@@ -342,7 +385,7 @@ static int measure_bar(int fd, const struct vfio_region *full_bar, bool map_dmab
 	}
 
 	if (multithreaded) {
-		ret = measure_concurrent(map_fd, map_offset, bar, step, map_dmabuf);
+		ret = measure_concurrent(map_fd, map_offset, bar, step, map_dmabuf, map_early);
 		goto close_dmabuf;
 	}
 
@@ -393,10 +436,11 @@ close_dmabuf:
 
 int main(int argc, char **argv)
 {
-	enum { OPT_MAP_DMABUF = 256, OPT_MULTITHREADED, OPT_THP_DISABLE, OPT_ALIGN, OPT_STRIDE };
+	enum { OPT_MAP_DMABUF = 256, OPT_MULTITHREADED, OPT_MT_MAP_LATE, OPT_THP_DISABLE, OPT_ALIGN, OPT_STRIDE };
 	static const struct option long_options[] = {
 		{ "map-dmabuf", no_argument, NULL, OPT_MAP_DMABUF },
 		{ "multithreaded", no_argument, NULL, OPT_MULTITHREADED },
+		{ "mt-map-late", no_argument, NULL, OPT_MT_MAP_LATE },
 		{ "thp-disable", no_argument, NULL, OPT_THP_DISABLE },
 		{ "align", required_argument, NULL, OPT_ALIGN },
 		{ "stride", required_argument, NULL, OPT_STRIDE },
@@ -409,6 +453,7 @@ int main(int argc, char **argv)
 	int group = -1;
 	bool map_dmabuf = false;
 	bool multithreaded = false;
+	bool map_early = true;
 	bool thp_disable = false;
 	int fd, option;
 	int iommufd = -1;
@@ -434,6 +479,9 @@ int main(int argc, char **argv)
 			break;
 		case OPT_MULTITHREADED:
 			multithreaded = true;
+			break;
+		case OPT_MT_MAP_LATE:
+			map_early = false;
 			break;
 		case OPT_THP_DISABLE:
 			thp_disable = true;
@@ -518,7 +566,7 @@ int main(int argc, char **argv)
 			" MiB found on %s\n", (uint64_t)MIN_BAR_SIZE / 1024 / 1024, devname);
 		goto close_fds;
 	}
-	if (!measure_bar(fd, &selection.bar, map_dmabuf, multithreaded))
+	if (!measure_bar(fd, &selection.bar, map_dmabuf, multithreaded, map_early))
 		status = EXIT_SUCCESS;
 
 close_fds:
