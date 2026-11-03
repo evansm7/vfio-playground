@@ -1,7 +1,9 @@
+#define _GNU_SOURCE
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -51,6 +53,7 @@ static void usage(FILE *stream, const char *program)
 		"  --align MODE     VA placement vs. the BAR: pte (default; never huge),\n"
 		"                   pmd (2M mappings), pud (1G mappings), any (mmap() picks)\n"
 		"  --stride SIZE    Write once per SIZE bytes (default: base page size)\n"
+		"  --pin A[,B]      Pin the (parent) walker to CPU A, the child to CPU B\n"
 		"  -h               Show this help\n", program);
 }
 
@@ -75,6 +78,22 @@ static uint64_t win_offset, win_length, stride;
 #define ALIGN_PUD	0ULL
 #define ALIGN_ANY	(~0ULL)
 static uint64_t align_skew = ALIGN_PTE;
+static int pin_cpu[2] = { -1, -1 };
+
+static int pin_self(int slot)
+{
+	cpu_set_t set;
+
+	if (pin_cpu[slot] < 0)
+		return 0;
+	CPU_ZERO(&set);
+	CPU_SET(pin_cpu[slot], &set);
+	if (sched_setaffinity(0, sizeof(set), &set)) {
+		fprintf(stderr, "Cannot pin to CPU %d: %s\n", pin_cpu[slot], strerror(errno));
+		return -1;
+	}
+	return 0;
+}
 
 /*
  * Map [offset, offset+length) of fd at a VA chosen relative to the BAR.
@@ -265,6 +284,11 @@ static int measure_concurrent(int fd, off_t offset, const struct vfio_region *ba
 	}
 	if (child == 0) {
 		int status;
+
+		if (pin_self(1)) {
+			atomic_store_explicit(&state->abort, 1, memory_order_release);
+			_exit(EXIT_FAILURE);
+		}
 		if (map_early)
 			status = cold_process(state, 1, mapping, bar->size, step);
 		else
@@ -274,6 +298,8 @@ static int measure_concurrent(int fd, off_t offset, const struct vfio_region *ba
 		_exit(status ? EXIT_FAILURE : EXIT_SUCCESS);
 	}
 
+	if (pin_self(0))
+		atomic_store_explicit(&state->abort, 1, memory_order_release);
 	if (map_early)
 		cold_process(state, 0, mapping, bar->size, step);
 	else
@@ -300,6 +326,9 @@ static int measure_concurrent(int fd, off_t offset, const struct vfio_region *ba
 	       bar->index, bar->size, pages, step);
 	printf("Mapping: %s; concurrent cold passes in two processes, mmap %s\n",
 	       map_dmabuf ? "DMABUF" : "VFIO cdev", map_early ? "common" : "in each");
+	if (pin_cpu[0] >= 0 || pin_cpu[1] >= 0)
+		printf("Pinned: parent CPU %d, child CPU %d (-1: not pinned)\n",
+		       pin_cpu[0], pin_cpu[1]);
 	printf("Parent cold access (PID %ld): %.3f us total, %.1f ns/page\n",
 	       (long)getpid(), state->result[0].elapsed_ns / 1e3,
 	       (double)state->result[0].elapsed_ns / pages);
@@ -389,6 +418,9 @@ static int measure_bar(int fd, const struct vfio_region *full_bar, bool map_dmab
 		goto close_dmabuf;
 	}
 
+	if (pin_self(0))
+		goto close_dmabuf;
+
 	/* Leave the VMA untouched until the first timed pass. */
 	mapping = map_window(map_fd, map_offset, length);
 	if (mapping == MAP_FAILED) {
@@ -405,6 +437,8 @@ static int measure_bar(int fd, const struct vfio_region *full_bar, bool map_dmab
 	printf("BAR%u: %" PRIu64 " bytes, %zu pages, %zu-byte stride\n",
 	       bar->index, bar->size, pages, step);
 	printf("Mapping: %s\n", map_dmabuf ? "DMABUF" : "VFIO cdev");
+	if (pin_cpu[0] >= 0)
+		printf("Pinned: CPU %d\n", pin_cpu[0]);
 	printf("First access:  %.3f us total, %.1f ns/page\n",
 	       first_ns / 1e3, (double)first_ns / pages);
 	printf("Second access: %.3f us total, %.1f ns/page\n",
@@ -436,7 +470,7 @@ close_dmabuf:
 
 int main(int argc, char **argv)
 {
-	enum { OPT_MAP_DMABUF = 256, OPT_MULTITHREADED, OPT_MT_MAP_LATE, OPT_THP_DISABLE, OPT_ALIGN, OPT_STRIDE };
+	enum { OPT_MAP_DMABUF = 256, OPT_MULTITHREADED, OPT_MT_MAP_LATE, OPT_THP_DISABLE, OPT_ALIGN, OPT_STRIDE, OPT_PIN };
 	static const struct option long_options[] = {
 		{ "map-dmabuf", no_argument, NULL, OPT_MAP_DMABUF },
 		{ "multithreaded", no_argument, NULL, OPT_MULTITHREADED },
@@ -444,6 +478,7 @@ int main(int argc, char **argv)
 		{ "thp-disable", no_argument, NULL, OPT_THP_DISABLE },
 		{ "align", required_argument, NULL, OPT_ALIGN },
 		{ "stride", required_argument, NULL, OPT_STRIDE },
+		{ "pin", required_argument, NULL, OPT_PIN },
 		{ 0 },
 	};
 	struct vfio_device_info info;
@@ -497,6 +532,12 @@ int main(int argc, char **argv)
 				align_skew = ALIGN_ANY;
 			else {
 				fprintf(stderr, "--align takes pte, pmd, pud or any\n");
+				return EXIT_FAILURE;
+			}
+			break;
+		case OPT_PIN:
+			if (sscanf(optarg, "%d,%d", &pin_cpu[0], &pin_cpu[1]) < 1) {
+				fprintf(stderr, "--pin takes A or A,B\n");
 				return EXIT_FAILURE;
 			}
 			break;
