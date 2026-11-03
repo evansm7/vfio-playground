@@ -59,6 +59,20 @@ its pass and reports both times.  Scheduling can still introduce start
 skew; simultaneous execution requires both processes to be scheduled
 on different CPUs.
 
+Where the two processes run matters as much as what is measured. On a
+32-core EPYC 9334 (Zen4, four CCDs), two walkers on different CCDs took
+~28% longer per fault than two sharing an L3, and unpinned runs are a
+mix of both. `--pin A,B` pins the parent to CPU A and the child to CPU
+B right after `fork()`; `--pin A` pins only the parent, or the single
+process without `--multithreaded`. (`taskset` can't separate them, as
+both processes inherit its mask.)
+
+```sh
+# Both walkers on one CCD, then on two (check cpu*/cache/index3/shared_cpu_list)
+./build/vfio-barmap-perf/vfio-barmap-perf -d /dev/vfio/devices/vfio0 --multithreaded --pin 2,3
+./build/vfio-barmap-perf/vfio-barmap-perf -d /dev/vfio/devices/vfio0 --multithreaded --pin 2,10
+```
+
 In the default mode, each of two consecutive passes writes a volatile
 32-bit zero at the start
 of every base system page. Both loops are timed with
